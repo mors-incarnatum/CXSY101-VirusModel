@@ -1,0 +1,1551 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[;; Autonomous mall interactions with user-controlled values, 27 October 2026.
+;; One tick = one second; one patch ~= one metre. No recovery/death phase.
+breed [viruses virus]
+breed [customers customer]
+breed [securities security]
+breed [staffs staff-member]
+breed [stores store]
+
+turtles-own [
+  is_infected is_wearing_mask body_temperature in_shop is_moving
+  target_destination current_store assigned_store test_result tested_at
+  blocked_by escort_guard escort_target finished_shopping
+  pending_action action_target route route_goal last_action
+  attended_by next_interaction action_progress_at action_deadline leaving_without_purchase
+]
+viruses-own [host phase transmission_rate transmission_radius
+  transmission_success_percentage_threshold mask_reduction_factor
+  incubation_timer infected_at contagious_at next_check]
+securities-own [enforcement_radius current_task screening_target]
+stores-own [store_name store_capacity store_capacity_limit entrance]
+patches-own [walkable zone route_mark route_parent danger_radius]
+globals [
+  exit_patch entrance_patch bathroom_patch search_number ready?
+  total_infections completed_shopping normal_departures
+  escorted_departures entry_refusals failed_avoidance
+  virus-settings walking-speed initial-case-count
+  customer-target arrival-mask-percent customer-arrivals
+]
+
+
+to setup
+  clear-all
+  ;; Sliders choose the starting values. Keep them fixed for this run.
+  set walking-speed movement-speed
+  set virus-settings (list transmission-interval radius-setting
+    (base-transmission-percent / 100) (mask-reduction-percent / 100)
+    (incubation-minutes * 60))
+  set initial-infected min list initial-infected customer-population
+  set staff-population min list staff-population (4 * initial-store-capacity)
+  set initial-case-count initial-infected
+  set customer-target customer-population
+  set arrival-mask-percent customer-mask-percent
+  resize-world -16 16 -16 16
+  set-topology false false
+  set ready? false
+  reset-ticks
+  ask patches [
+    set walkable (abs pxcor < 16 and abs pycor < 16)
+    set zone nobody set route_parent nobody set danger_radius 0
+    set pcolor ifelse-value walkable [9] [1]
+  ]
+  set exit_patch patch 0 -15
+  set entrance_patch patch 2 -15
+  set bathroom_patch patch 0 14
+  ask exit_patch [set pcolor red set plabel "EXIT" set plabel-color white]
+  ask entrance_patch [set pcolor green set plabel "ENTRY" set plabel-color white]
+  ask bathroom_patch [set pcolor violet set plabel "BATHROOM" set plabel-color white]
+  (foreach ["Store A" "Store B" "Food Court" "Front Desk"] [-9 9 -9 9] [9 9 -9 -9]
+    [ [nm sx sy] ->
+      create-stores 1 [
+        setxy sx sy set store_name nm set label nm set label-color white
+        set shape "house" set size 1.5 set color 105
+        set store_capacity_limit initial-store-capacity set store_capacity 0
+        set entrance patch sx (sy - 4 * ifelse-value (sy > 0) [1] [-1])
+        let owner self
+        ask patches with [abs (pxcor - sx) <= 4 and abs (pycor - sy) <= 4] [
+          ifelse abs (pxcor - sx) = 4 or abs (pycor - sy) = 4
+            [set walkable false set pcolor 1]
+            [set walkable true set zone owner set pcolor 103]
+        ]
+        ask entrance [set walkable true set pcolor 47]
+      ]
+    ])
+  set-default-shape customers "person"
+  set-default-shape securities "person"
+  set-default-shape staffs "person"
+  set-default-shape viruses "bug"
+  let store-list sort stores
+  let staff-index 0
+  repeat staff-population [
+    let s item (staff-index mod length store-list) store-list
+    create-staffs 1 [initialize-human set assigned_store s move-to s sync-location]
+    set staff-index staff-index + 1
+  ]
+  create-securities security-population [
+    initialize-human set enforcement_radius enforcement-radius-setting
+    set current_task "Patrolling" move-to one-of corridor-patches sync-location
+  ]
+  create-customers customer-population [
+    initialize-human move-to one-of corridor-patches sync-location
+  ]
+  ask n-of initial-case-count customers [acquire-infection true nobody]
+  (foreach (list customers securities staffs)
+    (list customer-mask-percent security-mask-percent staff-mask-percent)
+    [[people percent] ->
+      ask n-of (ceiling (count people * percent / 100)) people [set is_wearing_mask true]
+    ])
+  set ready? true
+  refresh-danger refresh-display
+end
+
+
+to initialize-human
+  set is_infected false set is_wearing_mask false set body_temperature 36.5
+  set in_shop false set is_moving false set current_store nobody set assigned_store nobody
+  set target_destination nobody set test_result "Untested" set tested_at -1
+  set blocked_by nobody set escort_guard nobody set escort_target nobody
+  set finished_shopping false set pending_action "" set action_target nobody
+  set route [] set route_goal nobody set last_action "Setup" set size 0.9
+  set attended_by nobody set next_interaction 0 set action_progress_at 0
+  set action_deadline 0 set leaving_without_purchase false
+  if breed = securities [set screening_target nobody]
+end
+
+to-report humans
+  report (turtle-set customers securities staffs)
+end
+
+to-report corridor-patches
+  report patches with [walkable and zone = nobody and self != exit_patch and self != entrance_patch and self != bathroom_patch]
+end
+
+to-report breed-name
+  if breed = customers [report "Customer"]
+  if breed = staffs [report "Staff"]
+  if breed = securities [report "Security"]
+  report "Store"
+end
+
+
+to go
+  if not ready? [stop]
+  refresh-danger
+  ask humans [set is_moving false]
+  ask securities [security-decisions]
+  ask staffs [staff-decisions]
+  ask customers [customer-conversations]
+  ask humans [human-step]
+  replenish-customers
+  ;; Transmit after movements. Existing viruses alone are processed this tick.
+  ask viruses [virus-step]
+  refresh-display
+  tick
+  ;; Displayed time and incubation clocks agree at the end of each second.
+  ask viruses with [phase = "Incubating"] [
+    set incubation_timer max list 0 (contagious_at - ticks)
+    if incubation_timer = 0 [
+      set phase "Contagious"
+    ]
+  ]
+end
+
+to replenish-customers
+  ;; Admit one new shopper per simulated second while below the setup target.
+  ;; Departed agents stay departed; arrivals have new identities and histories.
+  if count customers >= customer-target [stop]
+  create-customers 1 [
+    initialize-human
+    move-to entrance_patch
+    sync-location
+    set is_wearing_mask (random-float 100 < arrival-mask-percent)
+    set last_action "Arrive"
+    choose-destination
+    set customer-arrivals customer-arrivals + 1
+  ]
+end
+
+to security-decisions
+  if attended_by != nobody or blocked_by != nobody or escort_guard != nobody or escort_target != nobody [stop]
+  if screening_target != nobody and pending_action != "" [
+    ;; Pass an approach to an idle guard who is closer to the person.
+    let recipient screening_target let sender self
+    let helpers securities with [self != sender and available? and attended_by = nobody and
+      distance recipient <= enforcement_radius and distance recipient + 1 < [distance recipient] of sender]
+    if any? helpers [
+      let helper min-one-of helpers [distance recipient]
+      delegate-action who [who] of helper
+    ]
+    stop
+  ]
+  if not available? or ticks < next_interaction [stop]
+  let guard-self self
+  let people humans with [self != guard-self and available? and attended_by = nobody and ticks >= next_interaction and
+    distance guard-self <= [enforcement_radius] of guard-self and
+    (breed != securities or distance guard-self <= 1) and
+    (test_result = "Positive" or not is_wearing_mask or tested_at < 0 or ticks - tested_at >= 300)]
+  if not any? people [stop]
+  let recipient min-one-of people [distance guard-self]
+  set screening_target recipient
+  ask recipient [set attended_by guard-self]
+  request-action who [who] of recipient "Question"
+end
+
+to staff-decisions
+  if not available? or attended_by != nobody or assigned_store = nobody [stop]
+  let seller self
+  let visitors customers with [current_store = [assigned_store] of seller and
+    available? and attended_by = nobody]
+  let unmasked visitors with [not is_wearing_mask]
+  if any? unmasked [
+    let recipient min-one-of unmasked [distance seller]
+    ask recipient [set attended_by seller]
+    request-action who [who] of recipient "Question"
+    stop
+  ]
+  if ticks >= next_interaction and any? visitors in-radius 1 [
+    let recipient one-of visitors in-radius 1
+    ask recipient [set attended_by seller]
+    request-action who [who] of recipient "Talk"
+  ]
+end
+
+to customer-conversations
+  if not available? or attended_by != nobody or in_shop or ticks < next_interaction [stop]
+  let speaker self
+  let peers other customers in-radius 1 with [available? and attended_by = nobody and ticks >= next_interaction]
+  if any? peers [
+    let peer one-of peers
+    set last_action "Talk" set next_interaction ticks + 15
+    ask peer [set last_action "Talk" set next_interaction ticks + 15]
+  ]
+end
+
+to acquire-infection [initial? source]
+  if is_infected [stop]
+  set is_infected true
+  let person self
+  set total_infections total_infections + 1
+  hatch-viruses 1 [
+    set host person set size 0.3 hide-turtle
+    set transmission_rate item 0 virus-settings
+    set transmission_radius item 1 virus-settings
+    set transmission_success_percentage_threshold item 2 virus-settings
+    set mask_reduction_factor item 3 virus-settings
+    set infected_at ticks
+    set incubation_timer ifelse-value initial? [0] [item 4 virus-settings]
+    set contagious_at ticks + incubation_timer
+    set phase ifelse-value initial? ["Contagious"] ["Incubating"]
+    set next_check contagious_at + transmission_rate
+    set route [] set route_goal nobody
+  ]
+end
+
+to virus-step
+  if host = nobody [die]
+  move-to host
+  if phase = "Incubating" [
+    set incubation_timer max list 0 (contagious_at - ticks)
+    if incubation_timer = 0 [
+      set phase "Contagious"
+    ]
+  ]
+  if phase = "Contagious" and ticks >= next_check [
+    set next_check ticks + transmission_rate
+    let source host let probability transmission_success_percentage_threshold
+    let reduction mask_reduction_factor
+    let recipients humans with [not is_infected and distance source <= [transmission_radius] of myself]
+    foreach sort recipients [recipient ->
+      let effective probability
+      if [is_wearing_mask] of source or [is_wearing_mask] of recipient
+        [set effective probability * (1 - reduction)]
+      if not [is_infected] of recipient and random-float 1 < effective
+        [ask recipient [acquire-infection false source]]
+    ]
+  ]
+end
+
+to refresh-danger
+  ask patches [set danger_radius 0]
+  ask viruses with [phase = "Contagious"] [
+    if host != nobody and [test_result] of host = "Positive" [
+      let source host let radius transmission_radius
+      ask patches with [distance source <= radius] [set danger_radius danger_radius + 1]
+    ]
+  ]
+end
+
+to human-step
+  if escort_guard != nobody [stop] ;; paired movement is performed by the escorting guard
+  if escort_target != nobody [escort-step stop]
+  if blocked_by != nobody [stop]
+  if pending_action != "" [interaction-step stop]
+  if breed = customers and (finished_shopping or leaving_without_purchase) [travel exit_patch false if distance exit_patch < 0.05 [depart "Normal"] stop]
+  if breed = staffs [
+    if assigned_store != nobody and current_store = assigned_store [
+      if any? customers with [current_store = [assigned_store] of myself and not finished_shopping] [stop]
+      if target_destination = nobody or distance target_destination < 0.05 [
+        set target_destination one-of patches with [zone = [assigned_store] of myself]
+      ]
+      travel target_destination false
+    ]
+    stop
+  ]
+  if breed = customers and in_shop [
+    if attended_by != nobody [stop]
+    let s current_store
+    ;; Leave without counting a purchase if this store has no assigned staff.
+    if not any? staffs with [assigned_store = s] [
+      set leaving_without_purchase true set target_destination exit_patch
+      set route [] set route_goal nobody stop
+    ]
+    let sellers staffs with [assigned_store = s and current_store = s and available? and attended_by = nobody]
+    if any? sellers [
+      let seller min-one-of sellers [distance myself]
+      ifelse distance seller <= 1 [complete-purchase who] [travel [patch-here] of seller false]
+    ]
+    stop
+  ]
+  if target_destination = nobody [choose-destination]
+  if target_destination = nobody [stop]
+  let goal destination-patch target_destination
+  if goal = nobody [set target_destination nobody stop]
+  travel goal false
+  if goal != nobody and distance goal < 0.05 [
+    if breed = securities or target_destination = bathroom_patch [
+      set target_destination nobody set route []
+    ]
+  ]
+end
+
+to choose-destination
+  if breed = staffs [
+    set target_destination one-of patches with [zone = [assigned_store] of myself]
+    set route [] set route_goal nobody
+    stop
+  ]
+  if breed = securities [
+    set target_destination one-of corridor-patches
+    set route [] set route_goal nobody
+    stop
+  ]
+  let eligible shopping-stores
+  if not any? staffs [
+    set leaving_without_purchase true set target_destination exit_patch
+    set route [] set route_goal nobody stop
+  ]
+  ;; Each eligible named destination has one equal slot, including Bathroom.
+  set target_destination one-of sentence (sort eligible) (list bathroom_patch)
+  set route [] set route_goal nobody
+end
+
+to-report shopping-stores
+  report stores with [store_capacity < store_capacity_limit and
+    any? staffs with [assigned_store = myself]]
+end
+
+to-report destination-patch [destination]
+  if destination = nobody [report nobody]
+  if is-patch? destination [report destination]
+  if is-turtle? destination [report [patch-here] of destination]
+  report nobody
+end
+
+to sync-location
+  set current_store [zone] of patch-here
+  set in_shop (current_store != nobody)
+  ask stores [set store_capacity count customers with [current_store = myself]]
+end
+
+;; Routes use actual corridors and doorways. Admissions are serial because ASK
+;; executes one human at a time and sync-location runs immediately after a step.
+to travel [goal permit-exposure?]
+  if goal = nobody or distance goal < 0.05 [stop]
+  if route_goal != goal or empty? route [
+    set route_goal goal
+    set route find-route goal (not permit-exposure?)
+    if empty? route and not permit-exposure? [
+      set route find-route goal false
+      if not empty? route [
+        set failed_avoidance failed_avoidance + 1
+      ]
+    ]
+  ]
+  if empty? route [stop]
+  ;; Replan when a known positive host has moved into the planned next cell.
+  if not permit-exposure? and [danger_radius] of first route > 0 and [danger_radius] of patch-here = 0 [
+    let safe-route find-route goal true
+    ifelse empty? safe-route [
+      set failed_avoidance failed_avoidance + 1
+    ] [set route safe-route]
+  ]
+  ;; Spend the selected movement budget across cell centres each second.
+  let budget walking-speed
+  while [budget > 0.000001 and not empty? route] [
+    let next-cell first route
+    let stride min list budget (distance next-cell)
+    ifelse stride <= 0.000001 [set route but-first route] [
+      face next-cell
+      let landing patch-at-heading-and-distance heading stride
+      if landing = nobody [set route [] stop]
+      if not [walkable] of landing [set route [] stop]
+      if breed = staffs and [zone] of landing != assigned_store [set route [] stop]
+      let entering [zone] of landing
+      if breed = customers and entering != nobody and entering != current_store [
+        if [store_capacity] of entering >= [store_capacity_limit] of entering [
+          refuse-entry entering set route [] set route_goal nobody stop
+        ]
+      ]
+      fd stride
+      set budget budget - stride
+      set is_moving true set last_action "Move"
+      sync-location
+      if distance next-cell < 0.000001 [set route but-first route]
+    ]
+  ]
+end
+
+to refuse-entry [s]
+  set last_action "Entry Refused"
+  set entry_refusals entry_refusals + 1
+  let attendant one-of staffs with [assigned_store = s and blocked_by = nobody and escort_guard = nobody]
+  if attendant != nobody [ask attendant [set last_action "Block"]]
+  if breed = customers and pending_action = "" and not finished_shopping [
+    let alternatives shopping-stores with [self != s]
+    set target_destination ifelse-value any? alternatives [one-of alternatives] [nobody]
+  ]
+end
+
+to-report find-route [goal avoid?]
+  if goal = patch-here [report (list goal)]
+  set search_number search_number + 1
+  let mark search_number let origin patch-here let person self
+  let allowed-store [zone] of goal
+  let origin-store current_store
+  let initially-unsafe [danger_radius] of origin > 0
+  ask origin [set route_mark mark set route_parent nobody]
+  let queue (list origin) let cursor 0 let found? false
+  while [cursor < length queue and not found?] [
+    let cell item cursor queue set cursor cursor + 1
+    let candidates sort [neighbors4] of cell
+    foreach candidates [p ->
+      if [route_mark] of p != mark and [walkable] of p [
+        let store-ok? ([zone] of p = nobody or [zone] of p = origin-store or [zone] of p = allowed-store)
+        if [breed] of person = staffs [
+          set store-ok? ([zone] of p = [assigned_store] of person)
+        ]
+        let safe? (not avoid? or [danger_radius] of p = 0)
+        ;; Permit an already exposed person to step out without moving deeper in.
+        if initially-unsafe and [danger_radius] of p <= [danger_radius] of cell [set safe? true]
+        if store-ok? and safe? [
+          ask p [set route_mark mark set route_parent cell]
+          set queue lput p queue
+          if p = goal [set found? true]
+        ]
+      ]
+    ]
+  ]
+  if not found? [report []]
+  let path [] let cell goal
+  while [cell != origin] [set path fput cell path set cell [route_parent] of cell]
+  report path
+end
+
+to request-action [actor-number target-number action-name]
+  let actor turtle actor-number let recipient turtle target-number
+  if actor = nobody or recipient = nobody [stop]
+  if not member? actor sort humans or not member? recipient sort humans or actor = recipient
+    [stop]
+  let allowed ["Talk"]
+  if [breed] of actor = securities [set allowed ["Talk" "Question" "Block" "Test" "Supply Mask" "Escort" "Release"]]
+  if [breed] of actor = staffs [set allowed ["Talk" "Question" "Supply Mask"]]
+  if not member? action-name allowed [stop]
+  if action-name = "Escort" and [breed] of recipient != customers
+    [stop]
+  if not [available?] of actor [stop]
+  if [escort_guard] of recipient != nobody or [escort_target] of recipient != nobody
+    [stop]
+  if [breed] of actor = securities and [distance recipient] of actor > [enforcement_radius] of actor
+    [stop]
+  if [breed] of actor = staffs and [current_store] of recipient != [assigned_store] of actor
+    [stop]
+  ask actor [
+    set pending_action action-name set action_target recipient set route [] set route_goal nobody
+    set action_progress_at ticks
+    ;; Bound the whole interaction, including movement and guard delegation.
+    set action_deadline ticks + max list 120 (ceiling (120 / walking-speed))
+    if breed = securities [set current_task ifelse-value (action-name = "Test") ["Testing"] ["Enforcing"]]
+  ]
+end
+
+to-report available?
+  report blocked_by = nobody and escort_guard = nobody and escort_target = nobody and pending_action = "" and not finished_shopping and not leaving_without_purchase
+end
+
+to interaction-step
+  if action_target = nobody [
+    resume-role stop
+  ]
+  let recipient action_target
+  if [escort_guard] of recipient != nobody or [escort_target] of recipient != nobody [
+    resume-role stop
+  ]
+  if ticks >= action_deadline [
+    ask recipient [set next_interaction ticks + 15]
+    resume-role stop
+  ]
+  let contact-allowed? (breed = securities and member? pending_action ["Test" "Supply Mask" "Escort"])
+  if distance recipient > 1 or current_store != [current_store] of recipient [
+    travel [patch-here] of recipient contact-allowed?
+    if is_moving [set action_progress_at ticks]
+    if ticks - action_progress_at >= 30 [
+      ask recipient [set next_interaction ticks + 15]
+      resume-role
+      stop
+    ]
+  ]
+  if distance recipient > 1 or current_store != [current_store] of recipient [stop]
+  let act pending_action
+  set last_action act
+  if act = "Test" [
+    ask recipient [set test_result ifelse-value is_infected ["Positive"] ["Negative"] set tested_at ticks]
+  ]
+  if act = "Supply Mask" [
+    ask recipient [set is_wearing_mask true]
+  ]
+  if act = "Block" [
+    ask recipient [
+      set blocked_by myself set is_moving false
+      set pending_action "" set action_target nobody set route []
+    ]
+    queue-screening-step "Test"
+    stop
+  ]
+  if act = "Question" [
+    if breed = securities [queue-screening-step "Block" stop]
+    if breed = staffs and not [is_wearing_mask] of recipient [
+      set pending_action "Supply Mask" stop
+    ]
+  ]
+  if breed = securities and member? act ["Test" "Supply Mask"] [
+    if act = "Test" and not [is_wearing_mask] of recipient [queue-screening-step "Supply Mask" stop]
+    queue-screening-step (ifelse-value ([test_result] of recipient = "Positive" and [breed] of recipient = customers) ["Escort"] ["Release"])
+    stop
+  ]
+  if act = "Release" [
+    ask recipient [set blocked_by nobody set attended_by nobody]
+  ]
+  if act = "Escort" [
+    if [breed] of recipient != customers [resume-role stop]
+    set escort_target recipient
+    ask recipient [
+      set escort_guard myself set blocked_by nobody set pending_action ""
+      set action_target nobody set target_destination exit_patch set route []
+    ]
+    set pending_action "" set action_target nobody set target_destination exit_patch set route []
+    set current_task "Enforcing" stop
+  ]
+  resume-role
+end
+
+to queue-screening-step [act]
+  set pending_action act
+  set action_progress_at ticks
+  set current_task ifelse-value (act = "Test") ["Testing"] ["Enforcing"]
+end
+
+to resume-role
+  let actor self
+  ask humans with [attended_by = actor] [
+    set attended_by nobody
+    if blocked_by = actor [set blocked_by nobody]
+  ]
+  set pending_action "" set action_target nobody set route [] set route_goal nobody
+  set target_destination nobody set next_interaction ticks + 15
+  if breed = securities [set current_task "Patrolling" set screening_target nobody]
+end
+
+to escort-step
+  let companion escort_target
+  if companion = nobody [resume-role stop]
+  if [breed] of companion != customers [
+    ask companion [set escort_guard nobody set blocked_by nobody]
+    set escort_target nobody resume-role stop
+  ]
+  ;; Both approach each waypoint together; no remote teleport to exit.
+  if distance companion > 1 [travel [patch-here] of companion true stop]
+  travel exit_patch true
+  let guard-self self
+  ask companion [travel [patch-here] of guard-self true]
+  if distance exit_patch < 0.05 and [distance exit_patch] of companion < 0.05 [
+    ask companion [depart "Escorted"]
+    set escort_target nobody resume-role
+  ]
+end
+
+to depart [reason]
+  ;; Staff and security remain in the mall for the entire run.
+  if breed != customers [stop]
+  ifelse reason = "Escorted" [set escorted_departures escorted_departures + 1]
+    [set normal_departures normal_departures + 1]
+  let person self
+  ask viruses with [host = person] [die]
+  ask humans with [blocked_by = person] [set blocked_by nobody]
+  ask humans with [attended_by = person] [set attended_by nobody]
+  let old-store current_store
+  if old-store != nobody [ask old-store [set store_capacity store_capacity - 1]]
+  die
+end
+
+to complete-purchase [customer-number]
+  let buyer turtle customer-number
+  if buyer = nobody [stop]
+  if [breed] of buyer != customers [stop]
+  let s [current_store] of buyer
+  if s = nobody [stop]
+  if not [available?] of buyer or [attended_by] of buyer != nobody
+    [stop]
+  let sellers staffs with [assigned_store = s and current_store = s and available? and
+    attended_by = nobody and distance buyer <= 1]
+  if not any? sellers [stop]
+  let seller min-one-of sellers [distance buyer]
+  ask buyer [set finished_shopping true set last_action "Buy" set target_destination exit_patch set route []]
+  ask seller [set last_action "Sell"]
+  set completed_shopping completed_shopping + 1
+end
+
+to delegate-action [from-number to-number]
+  let sender turtle from-number let receiver turtle to-number
+  if sender = nobody or receiver = nobody [stop]
+  if not is-security? sender or not is-security? receiver or sender = receiver
+    [stop]
+  if [pending_action] of sender = "" or not [available?] of receiver
+    [stop]
+  let recipient [action_target] of sender let act [pending_action] of sender
+  if recipient = nobody or recipient = receiver
+    [stop]
+  if [distance recipient] of receiver > [enforcement_radius] of receiver
+    [stop]
+  ask receiver [set pending_action act set action_target recipient
+    set action_progress_at [action_progress_at] of sender
+    set action_deadline [action_deadline] of sender
+    set screening_target recipient
+    set current_task [current_task] of sender set route [] set route_goal nobody]
+  ask recipient [
+    set attended_by receiver
+    if blocked_by = sender [set blocked_by receiver]
+  ]
+  ask sender [resume-role]
+end
+
+
+
+to-report new-infections
+  report max list 0 (total_infections - initial-case-count)
+end
+
+to refresh-display
+  ask humans [
+    ;; Role colors apply to healthy people; infection overrides every role.
+    if breed = customers [set color green]
+    if breed = securities [set color cyan]
+    if breed = staffs [set color yellow]
+    if is_infected [set color red]
+    set label ifelse-value is_wearing_mask ["M"] [""]
+    set label-color ifelse-value in_shop [white] [black]
+  ]
+  ask stores [
+    ;; Occupancy counts customers only; keep doorway labels compact.
+    set label (word store_name " " store_capacity "/" store_capacity_limit)
+    set color 105
+    let s self
+    ask patches with [zone = s] [set pcolor 103]
+  ]
+end
+
+]]></code>
+  <widgets>
+    <view x="290" wrappingAllowedX="false" y="55" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="false" width="434" tickCounterLabel="seconds" maxPycor="16" updateMode="1" maxPxcor="16" minPxcor="-16"></view>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="135" display="Setup">setup</button>
+    <button x="155" y="10" height="35" disableUntilTicks="true" forever="true" kind="Observer" width="135" display="Go / Stop">go</button>
+    <button x="300" y="10" height="35" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="One second">go</button>
+    <slider x="740" step="1" y="380" max="10" width="270" display="initial-store-capacity" height="50" min="5" direction="Horizontal" default="5.0" variable="initial-store-capacity" units="customers"></slider>
+    <slider x="10" step="1" y="55" max="200" width="270" display="customer-population" height="50" min="0" direction="Horizontal" default="30.0" variable="customer-population"></slider>
+    <slider x="10" step="1" y="100" max="30" width="270" display="security-population" height="50" min="0" direction="Horizontal" default="3.0" variable="security-population"></slider>
+    <slider x="10" step="1" y="145" max="4 * initial-store-capacity" width="270" display="staff-population" height="50" min="0" direction="Horizontal" default="4.0" variable="staff-population"></slider>
+    <slider x="10" step="1" y="190" max="customer-population" width="270" display="initial-infected" height="50" min="0" direction="Horizontal" default="3.0" variable="initial-infected"></slider>
+    <slider x="10" step="1" y="250" max="100" width="270" display="customer-mask-percent" height="50" min="0" direction="Horizontal" default="50.0" variable="customer-mask-percent" units="%"></slider>
+    <slider x="10" step="1" y="295" max="100" width="270" display="security-mask-percent" height="50" min="0" direction="Horizontal" default="50.0" variable="security-mask-percent" units="%"></slider>
+    <slider x="10" step="1" y="340" max="100" width="270" display="staff-mask-percent" height="50" min="0" direction="Horizontal" default="50.0" variable="staff-mask-percent" units="%"></slider>
+    <slider x="740" step="1" y="55" max="10" width="270" display="transmission-interval" height="50" min="5" direction="Horizontal" default="7.0" variable="transmission-interval" units="sec"></slider>
+    <slider x="740" step="0.5" y="100" max="6" width="270" display="radius-setting" height="50" min="2" direction="Horizontal" default="4.0" variable="radius-setting" units="m"></slider>
+    <slider x="740" step="1" y="145" max="80" width="270" display="base-transmission-percent" height="50" min="50" direction="Horizontal" default="65.0" variable="base-transmission-percent" units="%"></slider>
+    <slider x="740" step="1" y="190" max="40" width="270" display="mask-reduction-percent" height="50" min="30" direction="Horizontal" default="35.0" variable="mask-reduction-percent" units="%"></slider>
+    <slider x="740" step="1" y="235" max="60" width="270" display="incubation-minutes" height="50" min="30" direction="Horizontal" default="45.0" variable="incubation-minutes" units="min"></slider>
+    <slider x="740" step="0.1" y="290" max="1" width="270" display="movement-speed" height="50" min="0.1" direction="Horizontal" default="0.4" variable="movement-speed" units="m/sec"></slider>
+    <slider x="740" step="1" y="335" max="30" width="270" display="enforcement-radius-setting" height="50" min="10" direction="Horizontal" default="20.0" variable="enforcement-radius-setting" units="m"></slider>
+    <monitor x="10" precision="0" y="400" height="60" fontSize="10" width="125" display="Customers present">count customers</monitor>
+    <monitor x="145" precision="0" y="400" height="60" fontSize="10" width="125" display="New infections">new-infections</monitor>
+    <monitor x="10" precision="0" y="450" height="60" fontSize="10" width="125" display="Purchases">completed_shopping</monitor>
+    <monitor x="145" precision="0" y="450" height="60" fontSize="10" width="125" display="Departures">normal_departures + escorted_departures</monitor>
+    <monitor x="740" precision="0" y="435" height="60" fontSize="10" width="270" display="New customer arrivals">customer-arrivals</monitor>
+    <plot x="10" autoPlotX="true" yMax="35.0" autoPlotY="true" yAxis="New cases" y="550" xMin="0.0" height="150" legend="false" xMax="60.0" yMin="0.0" width="1000" xAxis="Seconds" display="New infections">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="New infections" color="-2674135" legend="false">
+        <setup></setup>
+        <update>plot new-infections</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## UPDATED BEHAVIOR — 28 October 2026
+
+Open this model, choose slider settings, and press Setup before Go. Sliders are captured at Setup. One tick is one simulated second. Role colors and infection colors remain; the color-key and last-action panels were removed.
+
+Customers choose staffed stores with available customer capacity. Temporarily busy staff remain eligible for later service. Customers already in a store with no assigned staff leave without a purchase. If there are no staff anywhere, customers leave without a purchase; replacement arrivals still maintain the chosen population. These ordinary departures increase the departure counter but not purchases.
+
+Purchases require an available, unreserved staff member in the same shop within one metre. The nearest eligible staff member performs the sale.
+
+An interaction ends after 30 seconds without movement or an absolute deadline of max(120, ceiling(120 / movement-speed)) simulated seconds. The speed-scaled deadline permits slow travel, is preserved through delegation and screening steps, and releases reservations and blocks on expiry. Both parties receive the existing 15-second cooldown. This deadline applies before escorting; paired escorts keep their existing movement.
+
+Event and test histories and status-message logging have been removed. Current per-agent state (including test results and action state), aggregate counters, and the infection plot remain. There is no recovery/death phase. Staff remain in assigned stores and guards remain in the mall. Only customers count toward store capacity.
+
+This named model is standalone. The separate Viral Contagion.nlogox builder and source do not generate this variant.
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
